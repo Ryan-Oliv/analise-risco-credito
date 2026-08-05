@@ -1,3 +1,5 @@
+![Análise de Risco de Crédito e Previsão de Inadimplência](capa-projeto.png)
+
 # Análise de Risco de Crédito e Previsão de Inadimplência
 
 Pipeline de dados ponta a ponta para prever a probabilidade de um cliente entrar em
