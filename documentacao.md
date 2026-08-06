@@ -1,7 +1,7 @@
 # Documentação técnica
 
 Registro de decisões, queries e problemas encontrados ao longo do projeto.
-Para a visão geral e os resultados, ver o [README](README.md).
+Para a visão geral e os resultados, ver o [README](https://github.com/Ryan-Oliv/analise-risco-credito/blob/main/README.md).
 
 ---
 
@@ -25,9 +25,10 @@ Seria mais rápido carregar o CSV em um DataFrame e fazer tudo com `groupby`. Op
 deliberadamente pelo caminho mais longo: carregar em banco e explorar via SQL.
 
 Dois motivos:
+
 1. É como o dado chega na prática — dentro de um banco, não em um arquivo pronto
 2. A etapa serve para demonstrar domínio de SQL, que é o requisito mais comum nas
-   vagas de dados
+vagas de dados
 
 Pandas entra na etapa 2, para o que ele faz melhor: visualização e transformação.
 
@@ -61,8 +62,9 @@ df.to_sql('clientes', conn, if_exists='replace', index=False)
 conn.close()
 ```
 
-**Nota:** a coluna de índice do CSV original foi mantida na carga. Ela não tem valor
-analítico e deve ser descartada na etapa de EDA.
+**Nota:** diferente do planejado inicialmente, a coluna de índice do CSV original
+**não** foi mantida na carga — o parâmetro `index=False` já a descarta no momento da
+gravação. A pendência de "remover coluna de índice" registrada abaixo não se aplica.
 
 ---
 
@@ -128,78 +130,137 @@ FROM clientes;
 
 ---
 
-## Problemas encontrados e como pretendo tratar
+## Tratamento dos dados (etapa 2 — EDA em Python)
 
-### `DebtRatio` fora de escala — 20,7% da base
-
-**O problema:** a variável deveria ser uma proporção (despesas ÷ renda), mas 21.688
-registros têm valor acima de 2, chegando a 329.664.
-
-**Hipótese:** onde `MonthlyIncome` é nulo ou zero, a divisão provavelmente resultou no
-valor absoluto das despesas em vez da razão. Vale cruzar as duas colunas para
-confirmar.
-
-**Tratamento pendente:** confirmar a hipótese antes de decidir. Se a correlação com
-nulos de renda se confirmar, o tratamento dos dois problemas pode ser conjunto.
-
-### `MonthlyIncome` nulo — 19,8% da base
-
-**O problema:** volume alto demais para simplesmente descartar as linhas — perderia
-um quinto da base.
-
-**Opções em avaliação:**
-- Imputar pela mediana (não pela média, dada a assimetria à direita)
-- Imputar pela mediana da faixa etária correspondente
-- Criar uma flag `renda_informada` e testar se a ausência em si tem poder preditivo
-
-A terceira opção me parece a mais interessante: em crédito, não informar renda pode
-ser sinal por si só.
-
-### `RevolvingUtilization` acima de 1 — 243 registros
-
-Volume pequeno. Provável erro de cálculo ou caso limite de uso acima do limite
-contratado. Decidir entre truncar em 1 ou remover.
+Todas as transformações abaixo foram aplicadas sobre o DataFrame carregado a partir
+de `clientes` e salvas na nova tabela `clientes_tratados`, preservando a tabela
+original intacta.
 
 ### Idade inválida
 
-Um registro com `age = 0` — erro claro, será removido.
-Um registro com `age = 109` — plausível, será mantido.
+```python
+df = df[df["age"] > 0]
+```
 
-### Coluna de índice
+Removido o único registro com `age = 0`. O registro com `age = 109` foi mantido —
+plausível, não necessariamente erro.
 
-Descartar na etapa de EDA. Não tem valor analítico e pode ser confundida com feature
-pelo modelo.
+### `MonthlyIncome`: nulos e outliers
+
+Confirmada a hipótese de que o `DebtRatio` corrompido estava ligado à ausência de
+renda antes de decidir a estratégia de imputação (ver seção seguinte). Optei por
+imputar pela mediana da faixa etária, já que a renda varia de forma consistente com
+a idade (visto na etapa 1), em vez de uma mediana única para toda a base.
+
+```python
+df["faixa_etaria"] = pd.cut(df["age"], bins=[0, 29, 44, 59, 120],
+                             labels=["18-29", "30-44", "45-59", "60+"])
+
+mediana_por_faixa = df.groupby("faixa_etaria")["MonthlyIncome"].transform("median")
+df["MonthlyIncome"] = df["MonthlyIncome"].fillna(mediana_por_faixa)
+
+teto_renda = df["MonthlyIncome"].quantile(0.99)
+df["MonthlyIncome"] = df["MonthlyIncome"].clip(upper=teto_renda)
+```
+
+Outliers extremos (ex.: um registro de R$ 3.008.750,00) tratados com teto no
+percentil 99 (R$ 23.266,70), em vez de um valor de corte arbitrário.
+
+### `DebtRatio`: causa raiz identificada e corrigida
+
+Cruzando `DebtRatio` com a informação de renda nula:
+
+| Grupo                  | Mediana `DebtRatio` |
+| ----------------------- | --------------------- |
+| Renda informada         | 0,296                |
+| Renda nula (original)   | 1.164                |
+
+Quando a renda era nula, o valor de `DebtRatio` correspondia às despesas em valor
+absoluto — o cálculo despesas ÷ renda não pôde ser feito, e o numerador ficou
+registrado "cru" no lugar do resultado da divisão. Não é um problema de outliers
+aleatórios: é sistemático, atingindo 20,7% da base.
+
+**Tratamento:** para os registros afetados, recalculei `DebtRatio` = valor original
+(despesas) ÷ nova renda (já imputada). Para os outliers remanescentes (inclusive
+entre quem já tinha renda válida), apliquei teto no percentil 99.
+
+```python
+mask_corrompido = df["renda_informada"] == False
+df.loc[mask_corrompido, "DebtRatio"] = (
+    df.loc[mask_corrompido, "DebtRatio"] / df.loc[mask_corrompido, "MonthlyIncome"]
+)
+
+teto_debtratio = df["DebtRatio"].quantile(0.99)
+df["DebtRatio"] = df["DebtRatio"].clip(upper=teto_debtratio)
+```
+
+**Validação:** após o tratamento, a mediana do `DebtRatio` nos casos antes
+corrompidos passou a 0,28 — praticamente igual à mediana de quem sempre teve renda
+válida (0,296). Isso indica que a correção resolveu a causa do problema, e não
+apenas mascarou o sintoma com um corte arbitrário.
+
+### `RevolvingUtilizationOfUnsecuredLines`
+
+Sem uma causa identificável como no `DebtRatio` — outliers tratados diretamente com
+teto no percentil 99 (1,09).
+
+```python
+teto_revolving = df["RevolvingUtilizationOfUnsecuredLines"].quantile(0.99)
+df["RevolvingUtilizationOfUnsecuredLines"] = (
+    df["RevolvingUtilizationOfUnsecuredLines"].clip(upper=teto_revolving)
+)
+```
+
+### Matriz de correlação
+
+Identificada multicolinearidade forte entre as três variáveis de atraso (0,98-0,99
+entre si) — relevante para a etapa de modelagem, já que um modelo linear pode sofrer
+com essa redundância. Correlação linear de todas as variáveis com o alvo é fraca
+isoladamente (máx. 0,12), o que é esperado dado que os padrões mais fortes
+observados em SQL (ex.: 4,6% → 41,6% em atraso de 90+ dias) são relações não
+lineares — a correlação de Pearson não as captura bem.
+
+### Persistência
+
+```python
+conexao = sqlite3.connect("../credito.db")
+df.to_sql("clientes_tratados", conexao, if_exists="replace", index=False)
+conexao.close()
+```
 
 ---
 
 ## Observações para a modelagem
 
 - **Desbalanceamento (6,6%)**: avaliar `class_weight='balanced'` ou reamostragem.
-  Métrica principal: AUC-ROC. Acurácia não será usada como critério.
+Métrica principal: AUC-ROC. Acurácia não será usada como critério.
 - **`NumberOfTimes90DaysLate`** mostrou a relação mais forte com o alvo. Atenção a
-  possível vazamento conceitual — verificar se a variável é anterior à janela de
-  observação do alvo.
+possível vazamento conceitual — verificar se a variável é anterior à janela de
+observação do alvo.
 - **Relação em "U"** em `NumberOfOpenCreditLinesAndLoans`: modelo linear não captura
-  bem. Considerar binning ou modelo baseado em árvore.
+bem. Considerar binning ou modelo baseado em árvore.
+- **Multicolinearidade** entre as três variáveis de atraso: avaliar remoção de
+redundância caso o modelo final seja linear.
 
 ---
 
 ## Log de progresso
 
-| Etapa | Status | Notas |
-|---|---|---|
-| 1. Exploração SQL | Concluída | Achados consolidados no README |
-| 2. EDA em Python | Em andamento | Tratamento dos problemas listados acima |
-| 3. Modelo (scikit-learn) | Pendente | — |
-| 4. Power BI + AWS | Pendente | — |
-| 5. Documentação final | Contínuo | — |
+| Etapa                    | Status       | Notas                                                      |
+| ------------------------- | ------------- | ------------------------------------------------------------ |
+| 1. Exploração SQL        | Concluída     | Achados consolidados no README                              |
+| 2. EDA em Python         | Concluída     | Tratamentos aplicados, base salva em `clientes_tratados`     |
+| 3. Modelo (scikit-learn) | Em andamento  | Regressão Logística — `04_modelo_classificacao.ipynb`        |
+| 4. Power BI + AWS        | Pendente      | —                                                            |
+| 5. Documentação final    | Contínuo      | —                                                            |
 
 ---
 
 ## Pendências abertas
 
-- [ ] Confirmar hipótese sobre `DebtRatio` × `MonthlyIncome` nulo
-- [ ] Decidir estratégia de imputação de renda
-- [ ] Remover coluna de índice
+- [x] Confirmar hipótese sobre `DebtRatio` × `MonthlyIncome` nulo
+- [x] Decidir estratégia de imputação de renda
+- [x] ~~Remover coluna de índice~~ — não aplicável, `index=False` já resolvia isso
 - [ ] Verificar vazamento conceitual em `NumberOfTimes90DaysLate`
 - [ ] Definir estratégia para o desbalanceamento
+- [ ] Treinar e avaliar Regressão Logística
