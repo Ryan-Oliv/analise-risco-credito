@@ -195,7 +195,7 @@ git clone https://github.com/Ryan-Oliv/analise-risco-credito.git
 cd analise-risco-credito
 
 # instalar dependências
-pip install pandas numpy matplotlib scikit-learn jupyter
+pip install pandas numpy matplotlib seaborn scikit-learn jupyter
 
 # abrir os notebooks
 jupyter notebook
